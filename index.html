@@ -17,9 +17,14 @@
   h1 { text-align: center; margin: 0 0 12px; }
   .barra { display: flex; gap: 8px; margin-bottom: 8px; }
   #btnConectar { flex: 1; background: #1f6feb; font-weight: bold; }
+  #btnDetener { background: #da3633; }
   .estado { text-align: center; color: #8b949e; font-size: 14px; margin-bottom: 14px; }
-  .indicadores { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; font-size: 13px; }
-  .indicador { padding: 6px 10px; background: #21262d; border-radius: 20px; }
+  .indicadores { display: flex; justify-content: center; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; font-size: 13px; }
+  .indicador { padding: 6px 10px; background: #21262d; border-radius: 20px; display: flex; align-items: center; gap: 6px; }
+  .foco { width: 12px; height: 12px; border-radius: 50%; background: #30363d; }
+  .foco.rojo.on     { background: #ff3b30; box-shadow: 0 0 8px #ff3b30; }
+  .foco.amarillo.on { background: #ffcc00; box-shadow: 0 0 8px #ffcc00; }
+  .foco.verde.on    { background: #34c759; box-shadow: 0 0 8px #34c759; }
   #chat {
     height: 340px; overflow-y: auto; background: #0d1117; border: 1px solid #30363d;
     border-radius: 12px; padding: 14px; margin-bottom: 14px;
@@ -52,22 +57,28 @@
 
   <div class="barra">
     <button id="btnConectar">Conectar por Bluetooth</button>
+    <button id="btnDetener" title="Detiene todos los programas">⏹ Detener</button>
   </div>
   <div class="estado" id="estadoBT">Desconectado</div>
 
   <div class="indicadores">
     <div class="indicador" id="estadoPuerta">Puerta: -</div>
-    <div class="indicador" id="estadoLuz">Luz: -</div>
+    <div class="indicador">
+      Semáforo:
+      <span class="foco rojo" id="focoR"></span>
+      <span class="foco amarillo" id="focoY"></span>
+      <span class="foco verde" id="focoG"></span>
+    </div>
+    <div class="indicador" id="estadoProgramas">Programas: 0</div>
     <div class="indicador" id="estadoHora">Hora: -</div>
-    <div class="indicador" id="estadoTareas">Tareas: 0</div>
   </div>
 
   <div id="chat">
-    <div class="mensaje ia">Hola. Puedo controlar la puerta y la iluminacion de la casa. Primero conectate por Bluetooth.</div>
+    <div class="mensaje ia">Hola. Controlo la puerta y el semáforo: pídeme lo que quieras (secuencias, tiempos, repeticiones...). Primero conéctate por Bluetooth.</div>
   </div>
 
   <div class="entrada">
-    <input id="mensaje" type="text" placeholder="Escribe una instruccion..." autocomplete="off">
+    <input id="mensaje" type="text" placeholder="Ej: haz que el semáforo funcione como uno real" autocomplete="off">
     <button id="botonEnviar">Enviar</button>
   </div>
 
@@ -78,9 +89,9 @@
       <button id="btnGuardarKey">Guardar</button>
     </div>
     <div class="nota">
-      Se guarda solo en este navegador, no en la pagina publica.
-      Sin API Key igual funcionan las ordenes basicas:
-      "abre la puerta", "cierra la puerta", "enciende la luz", "apaga la luz".
+      Se guarda solo en este navegador, no en la página pública.
+      Sin API Key igual funcionan: "abre la puerta", "cierra la puerta",
+      "rojo", "amarillo", "verde", "apaga el semáforo" y "detener".
     </div>
   </details>
 </div>
@@ -98,11 +109,9 @@ const NOMBRE_BLE = "Casa-Inteligente";
 const OPENAI_URL   = "https://api.openai.com/v1/chat/completions";
 const OPENAI_MODEL = "gpt-4.1-mini";
 
-// Mismo numero que usa el ESP32 para cada accion
-const TIPOS = {
-  ABRIR_PUERTA: 1, CERRAR_PUERTA: 2, ENCENDER_LUZ: 3, APAGAR_LUZ: 4,
-  COLOR_LED: 5, CICLO_PUERTA: 6, PARPADEAR_LED: 7, CANCELAR_TAREAS: 8
-};
+const MAX_PROGRAMAS = 8;
+const MAX_PASOS = 60;
+const LUZ = { rojo: 1, amarillo: 2, verde: 4 };
 
 const $ = id => document.getElementById(id);
 
@@ -144,36 +153,44 @@ async function bombear() {
   bombear();
 }
 
-// Arma el comando de 11 bytes que entiende el ESP32
-function armarComando(tipo, demoraMs = 0, r = 0, g = 0, b = 0, repeticiones = 1, intervaloS = 1) {
-  demoraMs = Math.max(0, Math.min(Math.round(demoraMs), 604800000));
-  const ds = Math.max(2, Math.min(Math.round(intervaloS * 10), 65535));
-  return [
-    tipo,
-    demoraMs & 255, (demoraMs >>> 8) & 255, (demoraMs >>> 16) & 255, (demoraMs >>> 24) & 255,
-    r & 255, g & 255, b & 255,
-    Math.max(1, Math.min(repeticiones, 20)),
-    ds & 255, (ds >> 8) & 255
-  ];
-}
+const u32 = n => { n = Math.max(0, Math.round(n)) >>> 0; return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; };
+
+// Estado de la casa que lee la pagina
+let estadoCasa = null;
+
+// Que programa hay en cada lugar (slot) del ESP32
+const slots = Array.from({ length: MAX_PROGRAMAS }, () => ({ nombre: "", infinito: false, enviado: 0 }));
 
 async function leerEstado() {
-  if (!stateChar || enviando) return;
+  if (!stateChar || enviando || cola.length) return;
   try {
     const d = new Uint8Array((await stateChar.readValue()).buffer);
-    estadoCasa = { puerta: !!d[0], luz: !!d[1], tareas: d[2] };
+    estadoCasa = { angulo: d[0], luces: d[1], activos: d[2] };
     pintarEstado();
   } catch (e) { console.warn("estado", e); }
 }
 
-let estadoCasa = null;
+function slotOcupado(i) {
+  const activoEnEsp = estadoCasa && (estadoCasa.activos & (1 << i));
+  const recienEnviado = Date.now() - slots[i].enviado < 5000;
+  return !!(activoEnEsp || recienEnviado);
+}
+
+function programasActivos() {
+  return slots.map((s, i) => ({ ...s, slot: i })).filter(s => slotOcupado(s.slot) && s.nombre);
+}
 
 function pintarEstado() {
   $("estadoHora").textContent = "Hora: " + horaTexto();
   if (!estadoCasa) return;
-  $("estadoPuerta").textContent = "Puerta: " + (estadoCasa.puerta ? "abierta" : "cerrada");
-  $("estadoLuz").textContent    = "Luz: " + (estadoCasa.luz ? "encendida" : "apagada");
-  $("estadoTareas").textContent = "Tareas: " + estadoCasa.tareas;
+  const a = estadoCasa.angulo;
+  const txt = a === 0 ? "cerrada" : a === 90 ? "abierta" : "a " + a + "°";
+  $("estadoPuerta").textContent = `Puerta: ${txt}`;
+  $("focoR").classList.toggle("on", !!(estadoCasa.luces & LUZ.rojo));
+  $("focoY").classList.toggle("on", !!(estadoCasa.luces & LUZ.amarillo));
+  $("focoG").classList.toggle("on", !!(estadoCasa.luces & LUZ.verde));
+  const activos = programasActivos();
+  $("estadoProgramas").textContent = "Programas: " + (activos.length ? activos.map(p => p.nombre).join(", ") : "0");
 }
 
 async function conectarGatt() {
@@ -188,8 +205,8 @@ async function conectarGatt() {
 
   await leerEstado();
   clearInterval(sondeo);
-  sondeo = setInterval(leerEstado, 3000);   // tambien mantiene viva la conexion
-  bombear();                                // manda lo que quedo pendiente
+  sondeo = setInterval(leerEstado, 1500);   // tambien mantiene viva la conexion
+  bombear();
 }
 
 async function alDesconectar() {
@@ -199,7 +216,7 @@ async function alDesconectar() {
   if (!quiereConexion) { $("estadoBT").textContent = "Desconectado"; return; }
 
   for (let i = 1; i <= 10 && quiereConexion; i++) {
-    $("estadoBT").textContent = `Se corto, reconectando... (intento ${i})`;
+    $("estadoBT").textContent = `Se cortó, reconectando... (intento ${i})`;
     await new Promise(r => setTimeout(r, 1500));
     try { await conectarGatt(); return; } catch (e) { console.warn(e); }
   }
@@ -224,6 +241,11 @@ $("btnConectar").onclick = async () => {
   } catch (e) {
     $("estadoBT").textContent = "No se pudo conectar: " + e.message;
   }
+};
+
+$("btnDetener").onclick = () => {
+  detenerTodo();
+  agregarMensaje("Detuve todos los programas.", "ia");
 };
 
 
@@ -256,32 +278,75 @@ setInterval(pintarEstado, 1000);
 
 
 // =====================================================
-//               CONVERTIR ACCIONES EN COMANDOS
+//           MANDAR PROGRAMAS AL ESP32
 // =====================================================
 
-function mandarAccion(accion) {
-  // Formato viejo: "ABRIR_PUERTA"
-  if (typeof accion === "string") accion = { tipo: accion };
+function detenerTodo() {
+  encolar([0x20]);
+  slots.forEach(s => { s.nombre = ""; s.enviado = 0; });
+  if (estadoCasa) estadoCasa.activos = 0;
+}
 
-  const tipoTexto = String(accion.tipo || "").trim().toUpperCase();
-  const tipo = TIPOS[tipoTexto];
-  if (!tipo) return false;
+function detenerPorNombre(nombre) {
+  const n = String(nombre || "").toLowerCase();
+  slots.forEach((s, i) => {
+    if (s.nombre.toLowerCase() === n) {
+      encolar([0x21, i]);
+      s.nombre = ""; s.enviado = 0;
+      if (estadoCasa) estadoCasa.activos &= ~(1 << i);
+    }
+  });
+}
 
-  if (tipo === TIPOS.CANCELAR_TAREAS) { encolar([tipo]); return true; }
+// Convierte un programa de ChatGPT en comandos Bluetooth.
+// Devuelve "" si salio bien, o un texto con el problema.
+function mandarPrograma(prog) {
+  const nombre = String(prog.nombre || "programa").slice(0, 30);
 
-  let demora = Math.max(0, Number(accion.delay_s) || 0) * 1000;
-  if (accion.hora) {
-    const hasta = msHastaHora(accion.hora, Number(accion.dia_offset) || 0);
-    if (hasta < 0) return false;
+  // Tiempo de inicio
+  let demora = Math.max(0, Number(prog.inicio_s) || 0) * 1000;
+  if (prog.hora) {
+    const hasta = msHastaHora(prog.hora, Number(prog.dia_offset) || 0);
+    if (hasta < 0) return `no entendí la hora de "${nombre}"`;
     demora += hasta;
   }
+  if (demora > 604800000) return `"${nombre}" es para dentro de más de 7 días`;
 
-  const num = (v, def) => (v === undefined || v === null || isNaN(v)) ? def : Number(v);
-  const rep = num(accion.repeticiones, 1);
-  const intervalo = Math.max(0.2, num(accion.intervalo_s, 1));
+  // Pasos: cada paso de ChatGPT puede tener servo y/o luces
+  const pasos = [];
+  for (const p of (prog.pasos || [])) {
+    const t = Math.max(0, Number(p.t) || 0) * 1000;
+    if (p.servo !== undefined && p.servo !== null && !isNaN(p.servo)) {
+      const ang = Math.max(0, Math.min(180, Math.round(Number(p.servo))));
+      const vel = Math.max(0, Math.min(255, Math.round(Number(p.velocidad) || 0)));
+      pasos.push([t, 1, ang, vel]);
+    }
+    let encender = 0, cambiar = 0;
+    for (const [color, bit] of Object.entries(LUZ)) {
+      if (typeof p[color] === "boolean") {
+        cambiar |= bit;
+        if (p[color]) encender |= bit;
+      }
+    }
+    if (cambiar) pasos.push([t, 2, encender, cambiar]);
+  }
+  if (pasos.length === 0) return `"${nombre}" no tenía pasos`;
+  if (pasos.length > MAX_PASOS) return `"${nombre}" tiene demasiados pasos (máx ${MAX_PASOS})`;
 
-  encolar(armarComando(tipo, demora, 0, 0, 0, rep, intervalo));
-  return true;
+  // Lugar en el ESP32: si ya existe uno con el mismo nombre se reemplaza
+  let slot = slots.findIndex((s, i) => s.nombre && s.nombre.toLowerCase() === nombre.toLowerCase() && slotOcupado(i));
+  if (slot < 0) slot = slots.findIndex((s, i) => !slotOcupado(i));
+  if (slot < 0) return "ya hay 8 programas funcionando; detén alguno";
+
+  const repetir = Math.max(0, Math.min(255, Math.round(Number(prog.repetir ?? 1))));
+  const periodo = Math.max(0, Number(prog.ciclo_s) || 0) * 1000;
+
+  encolar([0x10, slot, ...u32(demora), repetir, ...u32(periodo), pasos.length]);
+  pasos.forEach(([t, tipo, a, b], i) => encolar([0x11, i, ...u32(t), tipo, a, b]));
+  encolar([0x12]);
+
+  slots[slot] = { nombre, infinito: repetir === 0, enviado: Date.now() };
+  return "";
 }
 
 
@@ -289,39 +354,61 @@ function mandarAccion(accion) {
 //                     CHATGPT
 // =====================================================
 
-const PROMPT_SISTEMA =
-  "Eres la inteligencia artificial de una maqueta de una casa inteligente controlada por ESP32. " +
-  "Los dispositivos reales disponibles son solamente una puerta con servomotor y una luz LED de un solo color " +
-  "(solo se puede encender o apagar, no cambia de color ni de intensidad). " +
-  "Si el usuario pide un color o una intensidad, explica amablemente que la luz solo se enciende o apaga. " +
-  "Debes interpretar lenguaje natural y convertirlo en acciones. " +
-  "Puedes encender o apagar la luz, programar acciones para despues, programarlas a una hora exacta, " +
-  "repetir la puerta y hacer parpadear el LED. " +
-  "Tipos permitidos: ABRIR_PUERTA, CERRAR_PUERTA, ENCENDER_LUZ, APAGAR_LUZ, CICLO_PUERTA, " +
-  "PARPADEAR_LED y CANCELAR_TAREAS. " +
-  "delay_s indica cuantos segundos esperar antes de iniciar la accion. " +
-  "Si el usuario dice 'en 5 segundos', usa delay_s 5. Si dice 'en una hora', usa delay_s 3600. " +
-  "Para una hora exacta usa hora en formato HH:MM de 24 horas. " +
-  "dia_offset vale 0 para la proxima ocurrencia de esa hora y 1 para manana. " +
-  "Para CICLO_PUERTA, repeticiones es la cantidad de veces que debe abrir y cerrar completamente. " +
-  "intervalo_s es el tiempo entre abrir y cerrar. " +
-  "Para PARPADEAR_LED, repeticiones es la cantidad de parpadeos e intervalo_s controla la velocidad. " +
-  "Puedes devolver varias acciones si el usuario pide una secuencia. " +
-  "Ejemplo: 'en 5 segundos abre la puerta y enciende la luz' son dos acciones. " +
-  "No inventes otros aparatos. Responde SIEMPRE solamente con JSON valido, sin markdown. " +
-  "Formato: {\"respuesta\":\"mensaje breve\",\"acciones\":[{\"tipo\":\"TIPO\",\"delay_s\":0,\"hora\":\"\"," +
-  "\"dia_offset\":0,\"repeticiones\":1,\"intervalo_s\":1}]}. " +
-  "Si no se necesita hacer nada, acciones debe ser un arreglo vacio.";
+const PROMPT_SISTEMA = `
+Eres la inteligencia artificial de una maqueta de casa inteligente con ESP32.
+Dispositivos reales (no inventes otros):
+- Una PUERTA movida por un servomotor. Angulo 0 = cerrada, 90 = abierta. Acepta cualquier angulo de 0 a 180.
+- Un SEMAFORO con 3 luces: rojo, amarillo y verde. Cada una se enciende o apaga por separado (no hay intensidad ni otros colores).
+
+Puedes hacer CUALQUIER cosa que se pueda lograr con esos dispositivos creando "programas".
+Un programa es una lista de pasos con tiempo. Cada paso puede:
+- mover la puerta: "servo" (angulo 0-180) y "velocidad" en grados por segundo (0 = de golpe; 1-255 = movimiento suave. Ej: para abrir de 0 a 90 en 3 segundos usa velocidad 30).
+- cambiar luces: "rojo", "amarillo", "verde" con true (encender) o false (apagar). Si no pones una luz, se queda como esta.
+Un paso puede tener servo y luces a la vez.
+
+Campos de un programa:
+- "nombre": nombre corto y unico (ej "semaforo", "baile", "alarma").
+- "inicio_s": segundos de espera antes de empezar (0 = ya).
+- "hora": "HH:MM" en 24h si el usuario pide una hora exacta, si no "". "dia_offset": 0 = proxima vez que llegue esa hora, 1 = mañana.
+- "repetir": cuantas veces se repite la secuencia completa. 1 = una vez. 0 = PARA SIEMPRE (hasta que el usuario lo detenga).
+- "ciclo_s": cuanto dura cada vuelta en segundos (importante cuando se repite; si es 0 se usa el tiempo del ultimo paso).
+- "pasos": lista de pasos, cada uno con "t" = segundos desde el inicio de la vuelta (puede tener decimales).
+
+Reglas:
+- Maximo 60 pasos por programa y 8 programas funcionando a la vez.
+- Varios programas pueden funcionar al mismo tiempo. Si un programa nuevo debe REEMPLAZAR a uno que esta funcionando
+  (por ejemplo cambiar el comportamiento del semaforo), ponlo en "detener" o usa el mismo nombre.
+- Si el usuario pide parar todo, usa "detener_todo": true.
+- Para que algo parpadee o se repita, usa "repetir" y "ciclo_s" en vez de escribir muchos pasos.
+- Si el usuario pide algo imposible (otro aparato, otro color, intensidad), explicalo amablemente y haz lo mas parecido posible.
+- "respuesta" debe ser un mensaje breve y amigable en español.
+
+Responde SIEMPRE solo con JSON valido, sin markdown, con este formato:
+{"respuesta":"texto","detener_todo":false,"detener":[],"programas":[{"nombre":"x","inicio_s":0,"hora":"","dia_offset":0,"repetir":1,"ciclo_s":0,"pasos":[{"t":0,"servo":90,"velocidad":0,"rojo":true}]}]}
+
+Ejemplos:
+- "abre la puerta": programas [{"nombre":"puerta","repetir":1,"pasos":[{"t":0,"servo":90,"velocidad":0}]}]
+- "semaforo real": programas [{"nombre":"semaforo","repetir":0,"ciclo_s":10,"pasos":[
+   {"t":0,"verde":true,"amarillo":false,"rojo":false},{"t":4,"verde":false,"amarillo":true},
+   {"t":6,"amarillo":false,"rojo":true}]}]
+- "parpadea el amarillo 5 veces": programas [{"nombre":"parpadeo","repetir":5,"ciclo_s":1,"pasos":[
+   {"t":0,"amarillo":true},{"t":0.5,"amarillo":false}]}]
+- "abre la puerta despacio en 5 segundos y ponla en verde": programas [{"nombre":"entrada","repetir":1,"pasos":[
+   {"t":0,"servo":90,"velocidad":18,"verde":true,"rojo":false,"amarillo":false}]}]
+- Si no hay que hacer nada: "programas": [].
+`.trim();
 
 async function preguntarChatGPT(mensajeUsuario) {
   const key = leerKey();
   if (!key) throw new Error("SIN_KEY");
 
-  const e = estadoCasa || { puerta: false, luz: false, tareas: 0 };
+  const e = estadoCasa || { angulo: 0, luces: 0 };
+  const lucesTxt = Object.entries(LUZ).map(([c, b]) => `${c} ${(e.luces & b) ? "encendido" : "apagado"}`).join(", ");
+  const activos = programasActivos();
   const contexto =
-    `Estado actual de la casa: puerta ${e.puerta ? "abierta" : "cerrada"}, ` +
-    `luz ${e.luz ? "encendida" : "apagada"}, ` +
-    `hora local ${horaTexto()}, tareas pendientes ${e.tareas}. ` +
+    `Estado actual: puerta en ${e.angulo} grados, semaforo: ${lucesTxt}. ` +
+    `Programas funcionando: ${activos.length ? activos.map(p => p.nombre + (p.infinito ? " (para siempre)" : "")).join(", ") : "ninguno"}. ` +
+    `Hora local: ${horaTexto()}. ` +
     `Mensaje del usuario: ${mensajeUsuario}`;
 
   const resp = await fetch(OPENAI_URL, {
@@ -330,10 +417,11 @@ async function preguntarChatGPT(mensajeUsuario) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       temperature: 0.2,
-      max_completion_tokens: 500,
+      max_completion_tokens: 2500,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: PROMPT_SISTEMA },
+        ...historial,
         { role: "user", content: contexto }
       ]
     })
@@ -347,8 +435,12 @@ async function preguntarChatGPT(mensajeUsuario) {
 
   const datos = await resp.json();
   const contenido = datos?.choices?.[0]?.message?.content || "";
+  historial.push({ role: "user", content: mensajeUsuario }, { role: "assistant", content: contenido });
+  while (historial.length > 8) historial.shift();   // recuerda las ultimas 4 conversaciones
   return JSON.parse(contenido);
 }
+
+const historial = [];
 
 
 // =====================================================
@@ -357,17 +449,21 @@ async function preguntarChatGPT(mensajeUsuario) {
 
 function controlLocal(mensaje) {
   const m = mensaje.toLowerCase();
-  if (m.includes("abre la puerta") || m.includes("abrir puerta") || m.includes("abrir la puerta")) {
-    mandarAccion("ABRIR_PUERTA"); return "He abierto la puerta.";
+  const simple = (nombre, paso) => mandarPrograma({ nombre, repetir: 1, pasos: [{ t: 0, ...paso }] });
+
+  if (m.includes("detener") || m.includes("para todo") || m.includes("deten")) {
+    detenerTodo(); return "Detuve todos los programas.";
   }
-  if (m.includes("cierra la puerta") || m.includes("cerrar puerta") || m.includes("cerrar la puerta")) {
-    mandarAccion("CERRAR_PUERTA"); return "He cerrado la puerta.";
+  if (m.includes("abre") || m.includes("abrir")) { simple("puerta", { servo: 90 }); return "He abierto la puerta."; }
+  if (m.includes("cierra") || m.includes("cerrar")) { simple("puerta", { servo: 0 }); return "He cerrado la puerta."; }
+  if (m.includes("apaga")) {
+    simple("luces", { rojo: false, amarillo: false, verde: false }); return "Apagué el semáforo.";
   }
-  if (m.includes("enciende la luz") || m.includes("encender la luz") || m.includes("prende la luz")) {
-    mandarAccion("ENCENDER_LUZ"); return "He encendido la luz.";
-  }
-  if (m.includes("apaga la luz") || m.includes("apagar la luz")) {
-    mandarAccion("APAGAR_LUZ"); return "He apagado la luz.";
+  for (const color of ["rojo", "amarillo", "verde"]) {
+    if (m.includes(color)) {
+      simple("luces", { rojo: color === "rojo", amarillo: color === "amarillo", verde: color === "verde" });
+      return `Puse el semáforo en ${color}.`;
+    }
   }
   return null;
 }
@@ -403,12 +499,18 @@ async function enviar() {
 
   try {
     const decision = await preguntarChatGPT(mensaje);
-    let fallidas = 0;
-    for (const accion of (decision.acciones || [])) {
-      if (!mandarAccion(accion)) fallidas++;
+
+    if (decision.detener_todo) detenerTodo();
+    for (const nombre of (decision.detener || [])) detenerPorNombre(nombre);
+
+    const problemas = [];
+    for (const prog of (decision.programas || [])) {
+      const error = mandarPrograma(prog);
+      if (error) problemas.push(error);
     }
-    let texto = decision.respuesta || "Accion realizada.";
-    if (fallidas) texto += ` (${fallidas} accion(es) no se pudieron programar)`;
+
+    let texto = decision.respuesta || "Listo.";
+    if (problemas.length) texto += " (Ojo: " + problemas.join("; ") + ")";
     esperando.textContent = texto;
   } catch (e) {
     console.warn(e);
@@ -420,7 +522,7 @@ async function enviar() {
     } else if (e.message === "HTTP_401") {
       esperando.textContent = "La API Key es incorrecta.";
     } else if (e.message === "HTTP_429") {
-      esperando.textContent = "La cuenta de OpenAI no tiene saldo o llego a su limite.";
+      esperando.textContent = "La cuenta de OpenAI no tiene saldo o llegó a su límite.";
     } else {
       esperando.textContent = "No pude comunicarme con ChatGPT. Revisa el internet del celular.";
     }
@@ -428,7 +530,6 @@ async function enviar() {
 
   $("botonEnviar").disabled = false;
   $("mensaje").focus();
-  setTimeout(leerEstado, 600);
 }
 
 $("botonEnviar").onclick = enviar;
