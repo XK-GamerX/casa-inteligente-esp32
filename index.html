@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Casa Inteligente</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: Arial, Helvetica, sans-serif; background: #0d1117; color: white;
+  }
+  .contenedor {
+    width: 92%; max-width: 600px; background: #161b22; border: 1px solid #30363d;
+    border-radius: 18px; padding: 22px; margin: 16px 0; box-shadow: 0 15px 50px rgba(0,0,0,.35);
+  }
+  h1 { text-align: center; margin: 0 0 12px; }
+  .barra { display: flex; gap: 8px; margin-bottom: 8px; }
+  #btnConectar { flex: 1; background: #1f6feb; font-weight: bold; }
+  .estado { text-align: center; color: #8b949e; font-size: 14px; margin-bottom: 14px; }
+  .indicadores { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; font-size: 13px; }
+  .indicador { padding: 6px 10px; background: #21262d; border-radius: 20px; }
+  #chat {
+    height: 340px; overflow-y: auto; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 12px; padding: 14px; margin-bottom: 14px;
+  }
+  .mensaje { padding: 10px 13px; margin: 8px 0; border-radius: 13px; max-width: 85%; word-wrap: break-word; }
+  .usuario { background: #1f6feb; margin-left: auto; }
+  .ia { background: #21262d; margin-right: auto; }
+  .entrada { display: flex; gap: 8px; }
+  input {
+    flex: 1; min-width: 0; border: 1px solid #30363d; border-radius: 10px; padding: 13px;
+    background: #0d1117; color: white; font-size: 16px; outline: none;
+  }
+  input:focus { border-color: #1f6feb; }
+  button {
+    border: none; border-radius: 10px; padding: 12px 17px; background: #238636;
+    color: white; font-size: 15px; cursor: pointer;
+  }
+  button:hover { opacity: .9; }
+  button:disabled { opacity: .5; cursor: default; }
+  details { margin-top: 16px; color: #8b949e; font-size: 14px; }
+  details summary { cursor: pointer; color: #58a6ff; }
+  details .entrada { margin-top: 10px; }
+  .nota { font-size: 12px; line-height: 1.4; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="contenedor">
+  <h1>Casa Inteligente</h1>
+
+  <div class="barra">
+    <button id="btnConectar">Conectar por Bluetooth</button>
+  </div>
+  <div class="estado" id="estadoBT">Desconectado</div>
+
+  <div class="indicadores">
+    <div class="indicador" id="estadoPuerta">Puerta: -</div>
+    <div class="indicador" id="estadoLuz">Luz: -</div>
+    <div class="indicador" id="estadoHora">Hora: -</div>
+    <div class="indicador" id="estadoTareas">Tareas: 0</div>
+  </div>
+
+  <div id="chat">
+    <div class="mensaje ia">Hola. Puedo controlar la puerta y la iluminacion de la casa. Primero conectate por Bluetooth.</div>
+  </div>
+
+  <div class="entrada">
+    <input id="mensaje" type="text" placeholder="Escribe una instruccion..." autocomplete="off">
+    <button id="botonEnviar">Enviar</button>
+  </div>
+
+  <details>
+    <summary>⚙️ API Key de ChatGPT</summary>
+    <div class="entrada">
+      <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
+      <button id="btnGuardarKey">Guardar</button>
+    </div>
+    <div class="nota">
+      Se guarda solo en este navegador, no en la pagina publica.
+      Sin API Key igual funcionan las ordenes basicas:
+      "abre la puerta", "cierra la puerta", "enciende la luz", "apaga la luz".
+    </div>
+  </details>
+</div>
+
+<script>
+// =====================================================
+//                    CONFIGURACION
+// =====================================================
+
+const SERVICE = "9b2e0001-7c1d-4e8a-b3f2-1a2b3c4d5e6f";
+const CMD     = "9b2e0002-7c1d-4e8a-b3f2-1a2b3c4d5e6f";
+const STATE   = "9b2e0003-7c1d-4e8a-b3f2-1a2b3c4d5e6f";
+const NOMBRE_BLE = "Casa-Inteligente";
+
+const OPENAI_URL   = "https://api.openai.com/v1/chat/completions";
+const OPENAI_MODEL = "gpt-4.1-mini";
+
+// Mismo numero que usa el ESP32 para cada accion
+const TIPOS = {
+  ABRIR_PUERTA: 1, CERRAR_PUERTA: 2, ENCENDER_LUZ: 3, APAGAR_LUZ: 4,
+  COLOR_LED: 5, CICLO_PUERTA: 6, PARPADEAR_LED: 7, CANCELAR_TAREAS: 8
+};
+
+const $ = id => document.getElementById(id);
+
+
+// =====================================================
+//                  API KEY (guardada local)
+// =====================================================
+
+function leerKey() {
+  try { return localStorage.getItem("openai_key") || ""; } catch (e) { return ""; }
+}
+$("apiKey").value = leerKey();
+$("btnGuardarKey").onclick = () => {
+  try { localStorage.setItem("openai_key", $("apiKey").value.trim()); } catch (e) {}
+  agregarMensaje("API Key guardada en este navegador.", "ia");
+};
+
+
+// =====================================================
+//                      BLUETOOTH
+// =====================================================
+
+let dispositivo = null, cmdChar = null, stateChar = null;
+let quiereConexion = false, sondeo = null;
+
+// Cola en orden: los comandos se mandan uno por uno
+const cola = [];
+let enviando = false;
+
+function encolar(bytes) { cola.push(bytes); bombear(); }
+
+async function bombear() {
+  if (enviando || !cmdChar || cola.length === 0) return;
+  enviando = true;
+  const bytes = cola.shift();
+  try { await cmdChar.writeValueWithResponse(new Uint8Array(bytes)); }
+  catch (e) { console.warn(e); cola.unshift(bytes); enviando = false; return; }
+  enviando = false;
+  bombear();
+}
+
+// Arma el comando de 11 bytes que entiende el ESP32
+function armarComando(tipo, demoraMs = 0, r = 0, g = 0, b = 0, repeticiones = 1, intervaloS = 1) {
+  demoraMs = Math.max(0, Math.min(Math.round(demoraMs), 604800000));
+  const ds = Math.max(2, Math.min(Math.round(intervaloS * 10), 65535));
+  return [
+    tipo,
+    demoraMs & 255, (demoraMs >>> 8) & 255, (demoraMs >>> 16) & 255, (demoraMs >>> 24) & 255,
+    r & 255, g & 255, b & 255,
+    Math.max(1, Math.min(repeticiones, 20)),
+    ds & 255, (ds >> 8) & 255
+  ];
+}
+
+async function leerEstado() {
+  if (!stateChar || enviando) return;
+  try {
+    const d = new Uint8Array((await stateChar.readValue()).buffer);
+    estadoCasa = { puerta: !!d[0], luz: !!d[1], tareas: d[2] };
+    pintarEstado();
+  } catch (e) { console.warn("estado", e); }
+}
+
+let estadoCasa = null;
+
+function pintarEstado() {
+  $("estadoHora").textContent = "Hora: " + horaTexto();
+  if (!estadoCasa) return;
+  $("estadoPuerta").textContent = "Puerta: " + (estadoCasa.puerta ? "abierta" : "cerrada");
+  $("estadoLuz").textContent    = "Luz: " + (estadoCasa.luz ? "encendida" : "apagada");
+  $("estadoTareas").textContent = "Tareas: " + estadoCasa.tareas;
+}
+
+async function conectarGatt() {
+  $("estadoBT").textContent = "Conectando...";
+  const gatt = await dispositivo.gatt.connect();
+  const srv  = await gatt.getPrimaryService(SERVICE);
+  cmdChar    = await srv.getCharacteristic(CMD);
+  stateChar  = await srv.getCharacteristic(STATE);
+
+  $("estadoBT").textContent = "✅ Conectado a " + dispositivo.name;
+  $("btnConectar").textContent = "Reconectar";
+
+  await leerEstado();
+  clearInterval(sondeo);
+  sondeo = setInterval(leerEstado, 3000);   // tambien mantiene viva la conexion
+  bombear();                                // manda lo que quedo pendiente
+}
+
+async function alDesconectar() {
+  cmdChar = null; stateChar = null;
+  clearInterval(sondeo);
+  $("btnConectar").textContent = "Conectar por Bluetooth";
+  if (!quiereConexion) { $("estadoBT").textContent = "Desconectado"; return; }
+
+  for (let i = 1; i <= 10 && quiereConexion; i++) {
+    $("estadoBT").textContent = `Se corto, reconectando... (intento ${i})`;
+    await new Promise(r => setTimeout(r, 1500));
+    try { await conectarGatt(); return; } catch (e) { console.warn(e); }
+  }
+  $("estadoBT").textContent = "No se pudo reconectar. Toca Conectar.";
+}
+
+$("btnConectar").onclick = async () => {
+  if (!navigator.bluetooth) {
+    $("estadoBT").textContent = "Este navegador no soporta Bluetooth web. Usa Chrome/Edge (o Bluefy en iPhone).";
+    return;
+  }
+  try {
+    $("estadoBT").textContent = "Buscando...";
+    if (dispositivo && dispositivo.gatt.connected) dispositivo.gatt.disconnect();
+    dispositivo = await navigator.bluetooth.requestDevice({
+      filters: [{ name: NOMBRE_BLE }],
+      optionalServices: [SERVICE]
+    });
+    dispositivo.addEventListener("gattserverdisconnected", alDesconectar);
+    quiereConexion = true;
+    await conectarGatt();
+  } catch (e) {
+    $("estadoBT").textContent = "No se pudo conectar: " + e.message;
+  }
+};
+
+
+// =====================================================
+//                       HORA
+// =====================================================
+
+function horaTexto() {
+  return new Date().toLocaleTimeString("es-PE", { hour12: false });
+}
+
+// Milisegundos hasta "HH:MM" (hoy o el dia siguiente). -1 si no es valida.
+function msHastaHora(hora, diaOffset) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((hora || "").trim());
+  if (!m) return -1;
+  const hh = +m[1], mm = +m[2];
+  if (hh > 23 || mm > 59) return -1;
+
+  const ahora = new Date();
+  const destino = new Date(ahora);
+  destino.setHours(hh, mm, 0, 0);
+  destino.setDate(destino.getDate() + Math.max(0, diaOffset || 0));
+  if (!diaOffset && destino <= ahora) destino.setDate(destino.getDate() + 1);
+
+  const dif = destino - ahora;
+  return (dif < 0 || dif > 7 * 24 * 3600 * 1000) ? -1 : dif;
+}
+
+setInterval(pintarEstado, 1000);
+
+
+// =====================================================
+//               CONVERTIR ACCIONES EN COMANDOS
+// =====================================================
+
+function mandarAccion(accion) {
+  // Formato viejo: "ABRIR_PUERTA"
+  if (typeof accion === "string") accion = { tipo: accion };
+
+  const tipoTexto = String(accion.tipo || "").trim().toUpperCase();
+  const tipo = TIPOS[tipoTexto];
+  if (!tipo) return false;
+
+  if (tipo === TIPOS.CANCELAR_TAREAS) { encolar([tipo]); return true; }
+
+  let demora = Math.max(0, Number(accion.delay_s) || 0) * 1000;
+  if (accion.hora) {
+    const hasta = msHastaHora(accion.hora, Number(accion.dia_offset) || 0);
+    if (hasta < 0) return false;
+    demora += hasta;
+  }
+
+  const num = (v, def) => (v === undefined || v === null || isNaN(v)) ? def : Number(v);
+  const rep = num(accion.repeticiones, 1);
+  const intervalo = Math.max(0.2, num(accion.intervalo_s, 1));
+
+  encolar(armarComando(tipo, demora, 0, 0, 0, rep, intervalo));
+  return true;
+}
+
+
+// =====================================================
+//                     CHATGPT
+// =====================================================
+
+const PROMPT_SISTEMA =
+  "Eres la inteligencia artificial de una maqueta de una casa inteligente controlada por ESP32. " +
+  "Los dispositivos reales disponibles son solamente una puerta con servomotor y una luz LED de un solo color " +
+  "(solo se puede encender o apagar, no cambia de color ni de intensidad). " +
+  "Si el usuario pide un color o una intensidad, explica amablemente que la luz solo se enciende o apaga. " +
+  "Debes interpretar lenguaje natural y convertirlo en acciones. " +
+  "Puedes encender o apagar la luz, programar acciones para despues, programarlas a una hora exacta, " +
+  "repetir la puerta y hacer parpadear el LED. " +
+  "Tipos permitidos: ABRIR_PUERTA, CERRAR_PUERTA, ENCENDER_LUZ, APAGAR_LUZ, CICLO_PUERTA, " +
+  "PARPADEAR_LED y CANCELAR_TAREAS. " +
+  "delay_s indica cuantos segundos esperar antes de iniciar la accion. " +
+  "Si el usuario dice 'en 5 segundos', usa delay_s 5. Si dice 'en una hora', usa delay_s 3600. " +
+  "Para una hora exacta usa hora en formato HH:MM de 24 horas. " +
+  "dia_offset vale 0 para la proxima ocurrencia de esa hora y 1 para manana. " +
+  "Para CICLO_PUERTA, repeticiones es la cantidad de veces que debe abrir y cerrar completamente. " +
+  "intervalo_s es el tiempo entre abrir y cerrar. " +
+  "Para PARPADEAR_LED, repeticiones es la cantidad de parpadeos e intervalo_s controla la velocidad. " +
+  "Puedes devolver varias acciones si el usuario pide una secuencia. " +
+  "Ejemplo: 'en 5 segundos abre la puerta y enciende la luz' son dos acciones. " +
+  "No inventes otros aparatos. Responde SIEMPRE solamente con JSON valido, sin markdown. " +
+  "Formato: {\"respuesta\":\"mensaje breve\",\"acciones\":[{\"tipo\":\"TIPO\",\"delay_s\":0,\"hora\":\"\"," +
+  "\"dia_offset\":0,\"repeticiones\":1,\"intervalo_s\":1}]}. " +
+  "Si no se necesita hacer nada, acciones debe ser un arreglo vacio.";
+
+async function preguntarChatGPT(mensajeUsuario) {
+  const key = leerKey();
+  if (!key) throw new Error("SIN_KEY");
+
+  const e = estadoCasa || { puerta: false, luz: false, tareas: 0 };
+  const contexto =
+    `Estado actual de la casa: puerta ${e.puerta ? "abierta" : "cerrada"}, ` +
+    `luz ${e.luz ? "encendida" : "apagada"}, ` +
+    `hora local ${horaTexto()}, tareas pendientes ${e.tareas}. ` +
+    `Mensaje del usuario: ${mensajeUsuario}`;
+
+  const resp = await fetch(OPENAI_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      max_completion_tokens: 500,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: PROMPT_SISTEMA },
+        { role: "user", content: contexto }
+      ]
+    })
+  });
+
+  if (!resp.ok) {
+    // 401 = API key incorrecta, 429 = sin saldo, 404 = modelo incorrecto
+    console.warn("ChatGPT HTTP", resp.status, await resp.text());
+    throw new Error("HTTP_" + resp.status);
+  }
+
+  const datos = await resp.json();
+  const contenido = datos?.choices?.[0]?.message?.content || "";
+  return JSON.parse(contenido);
+}
+
+
+// =====================================================
+//              CONTROL LOCAL (sin ChatGPT)
+// =====================================================
+
+function controlLocal(mensaje) {
+  const m = mensaje.toLowerCase();
+  if (m.includes("abre la puerta") || m.includes("abrir puerta") || m.includes("abrir la puerta")) {
+    mandarAccion("ABRIR_PUERTA"); return "He abierto la puerta.";
+  }
+  if (m.includes("cierra la puerta") || m.includes("cerrar puerta") || m.includes("cerrar la puerta")) {
+    mandarAccion("CERRAR_PUERTA"); return "He cerrado la puerta.";
+  }
+  if (m.includes("enciende la luz") || m.includes("encender la luz") || m.includes("prende la luz")) {
+    mandarAccion("ENCENDER_LUZ"); return "He encendido la luz.";
+  }
+  if (m.includes("apaga la luz") || m.includes("apagar la luz")) {
+    mandarAccion("APAGAR_LUZ"); return "He apagado la luz.";
+  }
+  return null;
+}
+
+
+// =====================================================
+//                       CHAT
+// =====================================================
+
+function agregarMensaje(texto, clase) {
+  const div = document.createElement("div");
+  div.className = "mensaje " + clase;
+  div.textContent = texto;
+  $("chat").appendChild(div);
+  $("chat").scrollTop = $("chat").scrollHeight;
+  return div;
+}
+
+async function enviar() {
+  const mensaje = $("mensaje").value.trim();
+  if (!mensaje) return;
+
+  agregarMensaje(mensaje, "usuario");
+  $("mensaje").value = "";
+
+  if (!cmdChar) {
+    agregarMensaje("No estoy conectado a la casa. Toca 'Conectar por Bluetooth' primero.", "ia");
+    return;
+  }
+
+  $("botonEnviar").disabled = true;
+  const esperando = agregarMensaje("Pensando...", "ia");
+
+  try {
+    const decision = await preguntarChatGPT(mensaje);
+    let fallidas = 0;
+    for (const accion of (decision.acciones || [])) {
+      if (!mandarAccion(accion)) fallidas++;
+    }
+    let texto = decision.respuesta || "Accion realizada.";
+    if (fallidas) texto += ` (${fallidas} accion(es) no se pudieron programar)`;
+    esperando.textContent = texto;
+  } catch (e) {
+    console.warn(e);
+    const local = controlLocal(mensaje);
+    if (local) {
+      esperando.textContent = local;
+    } else if (e.message === "SIN_KEY") {
+      esperando.textContent = "Para entender eso necesito tu API Key de ChatGPT (abajo, en ⚙️).";
+    } else if (e.message === "HTTP_401") {
+      esperando.textContent = "La API Key es incorrecta.";
+    } else if (e.message === "HTTP_429") {
+      esperando.textContent = "La cuenta de OpenAI no tiene saldo o llego a su limite.";
+    } else {
+      esperando.textContent = "No pude comunicarme con ChatGPT. Revisa el internet del celular.";
+    }
+  }
+
+  $("botonEnviar").disabled = false;
+  $("mensaje").focus();
+  setTimeout(leerEstado, 600);
+}
+
+$("botonEnviar").onclick = enviar;
+$("mensaje").addEventListener("keydown", ev => { if (ev.key === "Enter") enviar(); });
+</script>
+</body>
+</html>
